@@ -141,6 +141,7 @@ final class TiltRenderer: NSObject, MTKViewDelegate {
         }
 
         guard let enc = cb.makeRenderCommandEncoder(descriptor: rpd) else { return }
+        DiagLog.draw(hasTexture: texture != nil, params: model.params, size: size)
         if let texture {
             let geo = TiltGeometry(params: model.params, srcAspect: srcAspect,
                                    outAspect: Float(size.width / size.height))

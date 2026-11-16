@@ -62,6 +62,28 @@ final class SourceCatalog: ObservableObject {
         }
     }
 
+    /// Finds the source again after the capture dropped. Windows get new IDs when an app re-creates them
+    /// (e.g. Music entering/leaving full screen), so fall back to matching the same "App — Title".
+    /// Includes windows that are not on the active Space.
+    func resolve(id: SourceID, title: String) async -> SourceID? {
+        guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false) else { return nil }
+        switch id {
+        case .display(let d):
+            return content.displays.contains { $0.displayID == d } ? id : nil
+        case .window(let w):
+            if content.windows.contains(where: { $0.windowID == w }) { return id }
+            let matches = content.windows.filter { win in
+                guard win.windowLayer == 0, win.frame.width > 100, let app = win.owningApplication,
+                      let t = win.title, !t.isEmpty else { return false }
+                return "\(app.applicationName) — \(t)" == title
+            }
+            let best = matches.max { a, b in
+                (a.isOnScreen ? 1 : 0, a.frame.width * a.frame.height) < (b.isOnScreen ? 1 : 0, b.frame.width * b.frame.height)
+            }
+            return best.map { .window($0.windowID) }
+        }
+    }
+
     func makeFilter(for id: SourceID) async throws -> SCContentFilter {
         // Not on-screen-only: our own app must be found even if its window is minimized or on another Space.
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
@@ -116,6 +138,7 @@ final class CaptureService: NSObject, SCStreamOutput, SCStreamDelegate {
         config.queueDepth = 4
         config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
 
+        DiagLog.write("capture start \(width)x\(height) scale=\(scale) rect=\(info.contentRect)")
         let newStream = SCStream(filter: filter, configuration: config, delegate: self)
         try newStream.addStreamOutput(self, type: .screen, sampleHandlerQueue: sampleQueue)
         stream = newStream   // assign before awaiting so stop() can always reach it
@@ -148,6 +171,7 @@ final class CaptureService: NSObject, SCStreamOutput, SCStreamDelegate {
               let pixelBuffer = sampleBuffer.imageBuffer
         else { return }
         let handler = onFrame
+        DiagLog.frame(CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer), handler != nil)
         handler?(pixelBuffer)
     }
 

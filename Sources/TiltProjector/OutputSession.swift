@@ -16,21 +16,34 @@ final class OutputSession: NSObject, NSWindowDelegate {
     private let window: OutputWindow
     private let hud: NSPanel
     private var closing = false
+    private var targetScreenID: UInt32?
+    private var watchdog: Timer?
+    private var lastStateLog = Date.distantPast
 
     init?(model: TiltModel, output: OutputID) {
         guard let renderer = TiltRenderer(model: model) else { return nil }
         self.model = model
         self.renderer = renderer
 
+        // Regular apps cannot put windows over another app's full-screen Space; accessory apps can.
+        // Must happen before the window is created so it is assigned to the right Space.
+        if case .display = output { NSApp.setActivationPolicy(.accessory) }
+
         let screen: NSScreen
         switch output {
         case .display(let id):
+            targetScreenID = id
             screen = NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == id } ?? NSScreen.main ?? NSScreen.screens[0]
             window = OutputWindow(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false, screen: screen)
             window.setFrame(screen.frame, display: false)
-            window.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 1)
-            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            // Must also appear above other apps' full-screen Spaces on that display.
+            window.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
+            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
             window.hasShadow = false
+            // A non-opaque window does not count as covering what is beneath it, so the captured app
+            // (e.g. Music) is not marked occluded and keeps animating while our output sits on top.
+            window.isOpaque = false
+            window.alphaValue = 0.999
         case .floating:
             screen = NSScreen.main ?? NSScreen.screens[0]
             window = OutputWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 540),
@@ -40,11 +53,12 @@ final class OutputSession: NSObject, NSWindowDelegate {
             window.center()
         }
         window.isReleasedWhenClosed = false
-        window.backgroundColor = .black
+        window.backgroundColor = (window.isOpaque ? .black : .clear)
 
         let view = InteractiveMTKView(frame: window.contentLayoutRect)
         view.autoresizingMask = [.width, .height]
         renderer.attach(to: view)
+        if !window.isOpaque { (view.layer as? CAMetalLayer)?.isOpaque = false }
         window.contentView = view
 
         hud = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 300, height: 420),
@@ -56,7 +70,18 @@ final class OutputSession: NSObject, NSWindowDelegate {
         wire(view)
 
         window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
         window.makeFirstResponder(view)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let w = self?.window else { return }
+            DiagLog.write("window state visible=\(w.isVisible) activeSpace=\(w.isOnActiveSpace) occluded=\(!w.occlusionState.contains(.visible)) screen=\(w.screen?.localizedName ?? "nil") level=\(w.level.rawValue) policy=\(NSApp.activationPolicy().rawValue)")
+        }
+        if targetScreenID != nil {
+            watchdog = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.checkWindow() }
+            }
+        }
+        DiagLog.write("output window number=\(window.windowNumber) frame=\(window.frame)")
         // Output stays clean: only the tilted image. The HUD is hidden unless toggled with H.
     }
 
@@ -115,11 +140,26 @@ final class OutputSession: NSObject, NSWindowDelegate {
         }
     }
 
+    /// Keeps the full-screen output window where it belongs: moved to another display/Space or hidden -> put it back.
+    private func checkWindow() {
+        guard !closing, let id = targetScreenID else { return }
+        let screen = NSScreen.screens.first { AppController.screenID($0) == id }
+        var fixed: [String] = []
+        if let screen, window.frame != screen.frame { window.setFrame(screen.frame, display: true); fixed.append("frame") }
+        if !window.isVisible || !window.isOnActiveSpace { window.orderFrontRegardless(); fixed.append("front") }
+        let now = Date()
+        if !fixed.isEmpty || now.timeIntervalSince(lastStateLog) > 30 {
+            lastStateLog = now
+            DiagLog.write("output window check fixed=\(fixed) visible=\(window.isVisible) activeSpace=\(window.isOnActiveSpace) occluded=\(!window.occlusionState.contains(.visible)) screen=\(window.screen?.localizedName ?? "nil") frame=\(window.frame) displayPresent=\(screen != nil)")
+        }
+    }
+
     private func toggleHUD() {
         if hud.isVisible { hud.orderOut(nil) } else { window.addChildWindow(hud, ordered: .above); hud.orderFront(nil) }
     }
 
     private func requestClose() {
+        DiagLog.write("output: Esc pressed -> closing")
         close()
         onClose?()
     }
@@ -128,6 +168,8 @@ final class OutputSession: NSObject, NSWindowDelegate {
     func close() {
         if closing { return }
         closing = true
+        watchdog?.invalidate()
+        NSApp.setActivationPolicy(.regular)
         window.delegate = nil
         window.removeChildWindow(hud)
         hud.orderOut(nil)
@@ -136,8 +178,11 @@ final class OutputSession: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        DiagLog.write("output: windowWillClose closing=\(closing)")
         if closing { return }
         closing = true
+        watchdog?.invalidate()
+        NSApp.setActivationPolicy(.regular)
         hud.orderOut(nil)
         onClose?()
     }
